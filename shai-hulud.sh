@@ -405,7 +405,7 @@ scan_pnpm_lock() {
   if grep -q "lockfileVersion: '9" "$file" 2>/dev/null || grep -q "lockfileVersion: 9" "$file" 2>/dev/null; then
     # v9 structure: snapshotted packages are often under 'snapshots:'
     # We'll use a more general grep that catches @scope/name@version patterns
-    grep -oE '(@?[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+|[a-zA-Z0-9._-]+)@[0-9]+\.[0-9]+\.[0-9]+[^:]*' "$file" | sed 's/(@//g;s/)//g' | sort -u || true
+    grep -oE '(@?[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+|[a-zA-Z0-9._-]+)@[0-9]+\.[0-9]+\.[0-9]+' "$file" | sed 's|^/||' | sort -u || true
   else
     # Older pnpm versions
     grep -E '^\s+/.*:$' "$file" 2>/dev/null | sed "s|^\s*||;s|:$||;s|^/||" | sort -u || true
