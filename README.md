@@ -51,14 +51,14 @@ Options:
   -g, --global        Scan global npm packages (always included by default)
   -l, --local DIR     Scan a local project directory
   -b, --block         Write .npmrc scope blocklist after scan
+  -f, --fix           Attempt to remove/repair compromised packages
   -h, --help          Show this help
 
 Examples:
   ./shai-hulud.sh                        # scan global only
   ./shai-hulud.sh -l ./my-project        # scan global + local project
-  ./shai-hulud.sh -l . -l ../other-app   # scan multiple projects
+  ./shai-hulud.sh -l . --fix             # scan + remove malicious deps
   ./shai-hulud.sh --block                # scan + install .npmrc blocklist
-  ./shai-hulud.sh -l . --block           # scan everything + block
 ```
 
 ---
@@ -71,7 +71,9 @@ Examples:
 | Local `node_modules` | `npm list --depth=0` in project dir |
 | `package-lock.json` | Full packages section parsed with Python |
 | `yarn.lock` | Version entries extracted per block |
-| `pnpm-lock.yaml` | Package path entries parsed |
+| `pnpm-lock.yaml` | Support for v6-v9 lockfile structures |
+| `bun.lockb` | Binary parsing via `bun pm ls` or string extraction |
+| Heuristic | Scans `scripts` for `curl`, `base64`, `nslookup`, etc. |
 
 Lockfile scanning catches compromised versions **even before `npm install` runs** — useful for auditing PRs or freshly cloned repos.
 
@@ -113,7 +115,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run Shai-Hulud
         run: |
-          curl -sSf https://raw.githubusercontent.com/YOUR_USERNAME/shai-hulud/main/shai-hulud.sh \
+          curl -sSf https://raw.githubusercontent.com/lod93/shai-hulud/main/shai-hulud.sh \
             -o shai-hulud.sh
           chmod +x shai-hulud.sh
           ./shai-hulud.sh -l .
@@ -154,9 +156,10 @@ Full list → [`docs/affected-packages.md`](docs/affected-packages.md)
 
 - Bash 4+
 - Node.js / npm (for live environment scanning)
-- Python 3 (for lockfile parsing — available on virtually all systems)
+- Python 3 (for lockfile parsing)
+- Bun (optional, for `bun.lockb` deep scanning)
 
-No npm dependencies. No network calls. Runs entirely offline.
+No npm dependencies. No mandatory network calls. Runs entirely offline.
 
 ---
 

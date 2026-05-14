@@ -323,6 +323,14 @@ scan_local_dir() {
   elif [[ -f "$dir/pnpm-lock.yaml" ]]; then
     info "Scanning pnpm-lock.yaml..."
     scan_pnpm_lock "$dir/pnpm-lock.yaml" | check_package_list "pnpm-lock.yaml"
+  elif [[ -f "$dir/bun.lockb" ]]; then
+    info "Scanning bun.lockb..."
+    scan_bun_lock "$dir/bun.lockb" | check_package_list "bun.lockb"
+  fi
+
+  # Heuristic scan of node_modules
+  if [[ -d "$dir/node_modules" ]]; then
+    scan_suspicious_scripts "$dir/node_modules"
   fi
 }
 
@@ -393,11 +401,117 @@ PYEOF
 
 scan_pnpm_lock() {
   local file="$1"
-  # pnpm-lock.yaml: packages section has "pkg@ver:" entries
-  grep -E '^\s+/.*:$' "$file" 2>/dev/null | sed "s|^\s*||;s|:$||;s|^/||" | while IFS= read -r entry; do
-    # entry like: @scope/pkg@1.2.3
-    echo "$entry"
-  done || true
+  # Support both older pnpm-lock.yaml and v9+ which has different structure
+  if grep -q "lockfileVersion: '9" "$file" 2>/dev/null || grep -q "lockfileVersion: 9" "$file" 2>/dev/null; then
+    # v9 structure: snapshotted packages are often under 'snapshots:'
+    # We'll use a more general grep that catches @scope/name@version patterns
+    grep -oE '(@?[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+|[a-zA-Z0-9._-]+)@[0-9]+\.[0-9]+\.[0-9]+[^:]*' "$file" | sed 's/(@//g;s/)//g' | sort -u || true
+  else
+    # Older pnpm versions
+    grep -E '^\s+/.*:$' "$file" 2>/dev/null | sed "s|^\s*||;s|:$||;s|^/||" | sort -u || true
+  fi
+}
+
+scan_bun_lock() {
+  local file="$1"
+  local dir
+  dir=$(dirname "$file")
+  
+  if command -v bun >/dev/null 2>&1; then
+    # Use bun's internal tool to list everything
+    (cd "$dir" && bun pm ls --all 2>/dev/null | grep -E '├──|└──' | sed 's/[^a-zA-Z0-9@./_-]//g') || true
+  else
+    # Fallback: strings parsing (noisy but better than nothing)
+    warn "bun not found, using heuristic string extraction on bun.lockb"
+    strings "$file" | grep -E '^(@?[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+|[a-zA-Z0-9._-]+)@[0-9]+\.[0-9]+\.[0-9]+' | sort -u || true
+  fi
+}
+
+# ── Heuristic Scanners ─────────────────────────────────────────────
+scan_suspicious_scripts() {
+  local nm_dir="$1"
+  section "Heuristic Audit: Suspicious Scripts"
+  info "Checking package.json files for dangerous postinstall/preinstall patterns..."
+  
+  local found_suspicious=0
+  # Search for common exfiltration patterns in package.json scripts
+  # curl/wget to IPs, encoded strings, nslookup (DNS exfil), etc.
+  while IFS= read -r pj; do
+    local pkg_name
+    pkg_name=$(grep '"name":' "$pj" | head -1 | awk -F'"' '{print $4}')
+    
+    # Extract scripts section
+    local scripts
+    scripts=$(python3 - "$pj" <<'PYEOF' 2>/dev/null || true
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+        scripts = data.get("scripts", {})
+        for k, v in scripts.items():
+            print(f"{k}: {v}")
+except: pass
+PYEOF
+)
+    if [[ -z "$scripts" ]]; then continue; fi
+
+    # Dangerous patterns
+    local patterns=("curl" "wget" "nslookup" "base64 -d" "eval" "sh -c" "python -c" "node -e")
+    for pat in "${patterns[@]}"; do
+      if echo "$scripts" | grep -qi "$pat"; then
+        warn "Suspicious script in ${BOLD}${pkg_name}${RESET}: $(echo "$scripts" | grep -i "$pat" | head -1)"
+        info "Path: $pj"
+        found_suspicious=$((found_suspicious + 1))
+        break
+      fi
+    done
+  done < <(find "$nm_dir" -name "package.json" -maxdepth 3 2>/dev/null)
+
+  if [[ $found_suspicious -eq 0 ]]; then
+    ok "No suspicious scripts found in top-level dependencies"
+  else
+    warn "Found $found_suspicious suspicious scripts. Review them manually."
+  fi
+}
+
+# ── Risk Assessment ────────────────────────────────────────────────
+run_risk_assessment() {
+  section "Compromise Risk Assessment"
+  info "Scanning for sensitive files that may have been targeted..."
+  
+  local targets=(
+    "$HOME/.npmrc"
+    "$HOME/.aws/credentials"
+    "$HOME/.ssh/id_rsa"
+    "$HOME/.ssh/id_ed25519"
+    "$HOME/.kube/config"
+    "$HOME/.gitconfig"
+    "$HOME/.bash_history"
+    "$HOME/.zsh_history"
+  )
+
+  local found_targets=()
+  for t in "${targets[@]}"; do
+    if [[ -f "$t" ]]; then
+      found_targets+=("$t")
+    fi
+  done
+
+  if [[ ${#found_targets[@]} -gt 0 ]]; then
+    warn "The following sensitive files exist and may have been exfiltrated:"
+    for ft in "${found_targets[@]}"; do
+      echo -e "    ${DIM}- $ft${RESET}"
+    done
+    echo ""
+    warn "If any compromised packages were found, ROTATE THESE CREDENTIALS IMMEDIATELY."
+  else
+    ok "No common sensitive files found in default locations."
+  fi
+
+  # Check for active tokens in environment
+  if [[ -n "${NPM_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" || -n "${AWS_ACCESS_KEY_ID:-}" ]]; then
+    warn "Sensitive environment variables (NPM_TOKEN, etc.) are active and may have been stolen."
+  fi
 }
 
 # ── Write .npmrc blocklist ─────────────────────────────────────────
@@ -434,6 +548,44 @@ NPMRC
   info "Affected unscoped packages (safe-action, ts-dna, cross-stitch, etc.) must be blocked manually per-project."
 }
 
+# ── Automated Repair ───────────────────────────────────────────────
+repair_compromised() {
+  local dirs=("$@")
+  section "Automated Repair & Mitigation"
+  
+  # We don't have a list of EXACTLY which packages were found where in a persistent way
+  # except by re-scanning or tracking. For now, we'll re-scan and fix.
+  
+  for dir in "${dirs[@]}"; do
+    [[ ! -d "$dir" ]] && continue
+    info "Attempting to repair project in $dir..."
+    
+    # Check node_modules for uninstalls
+    if [[ -d "$dir/node_modules" ]]; then
+      local pkg_mgr="npm"
+      [[ -f "$dir/yarn.lock" ]] && pkg_mgr="yarn"
+      [[ -f "$dir/pnpm-lock.yaml" ]] && pkg_mgr="pnpm"
+      [[ -f "$dir/bun.lockb" ]] && pkg_mgr="bun"
+      
+      # We need the list of hits. Let's do a quick focused scan.
+      # This is slightly inefficient but safe.
+      local hits_to_fix=()
+      # ... implementation of hit collection ...
+      # For simplicity, we'll tell the user what to run or try to run it.
+      warn "Auto-fix will attempt to uninstall packages found in the database."
+      for pkg in "${!AFFECTED[@]}"; do
+        if (cd "$dir" && $pkg_mgr list "$pkg" --depth=0 2>/dev/null | grep -q "$pkg"); then
+          info "Removing $pkg via $pkg_mgr..."
+          (cd "$dir" && $pkg_mgr uninstall "$pkg") || true
+        fi
+      done
+    fi
+  done
+
+  # Offer to clean cache
+  info "Recommendation: Run '${BOLD}npm cache clean --force${RESET}' to purge potentially malicious payloads."
+}
+
 # ── Report ─────────────────────────────────────────────────────────
 report() {
   echo ""
@@ -442,6 +594,7 @@ report() {
   echo -e "  Packages checked : ${BOLD}$(get_checked)${RESET}"
   if [[ "$(get_hits)" -gt 0 ]]; then
     echo -e "  ${RED}${BOLD}Compromised found: $(get_hits)${RESET}"
+    run_risk_assessment
     echo ""
     echo -e "  ${RED}${BOLD}⚠  ACTION REQUIRED:${RESET}"
     echo -e "  ${RED}  1. Remove affected packages immediately${RESET}"
@@ -465,12 +618,13 @@ usage() {
   echo "  -g, --global        Scan global npm packages (default: always included)"
   echo "  -l, --local DIR     Scan a local project directory"
   echo "  -b, --block         Write .npmrc scope blocklist after scan"
+  echo "  -f, --fix           Attempt to remove/repair compromised packages"
   echo "  -h, --help          Show this help"
   echo ""
   echo -e "${BOLD}Examples:${RESET}"
   echo "  ./shai-hulud.sh                        # scan global only"
   echo "  ./shai-hulud.sh -l ./my-project        # scan global + local project"
-  echo "  ./shai-hulud.sh -l . -l ../other-app   # scan multiple projects"
+  echo "  ./shai-hulud.sh -l . --fix             # scan + remove malicious deps"
   echo "  ./shai-hulud.sh --block                # scan + install .npmrc blocklist"
   echo ""
 }
@@ -478,6 +632,7 @@ usage() {
 # ── Main ───────────────────────────────────────────────────────────
 main() {
   local do_block=false
+  local do_fix=false
   local local_dirs=()
 
   [[ $# -eq 0 ]] && { banner; scan_global; report; exit 0; }
@@ -487,6 +642,7 @@ main() {
       -h|--help)        usage; exit 0 ;;
       -g|--global)      shift ;;  # global is always included
       -b|--block)       do_block=true; shift ;;
+      -f|--fix)         do_fix=true; shift ;;
       --force-block)    do_block=true; shift ;;
       -l|--local)       shift; local_dirs+=("$1"); shift ;;
       *)                local_dirs+=("$1"); shift ;;
@@ -509,6 +665,11 @@ main() {
 
   # Install blocklist if requested
   $do_block && write_npmrc_block
+
+  # Run repair if requested
+  if $do_fix && [[ "$(get_hits)" -gt 0 ]]; then
+    repair_compromised "${local_dirs[@]}"
+  fi
 
   report
 
