@@ -617,14 +617,15 @@ usage() {
   echo -e "${BOLD}Options:${RESET}"
   echo "  -g, --global        Scan global npm packages (default: always included)"
   echo "  -l, --local DIR     Scan a local project directory"
+  echo "  -w, --workspace DIR Scan all projects recursively in DIR"
   echo "  -b, --block         Write .npmrc scope blocklist after scan"
   echo "  -f, --fix           Attempt to remove/repair compromised packages"
   echo "  -h, --help          Show this help"
   echo ""
   echo -e "${BOLD}Examples:${RESET}"
   echo "  ./shai-hulud.sh                        # scan global only"
-  echo "  ./shai-hulud.sh -l ./my-project        # scan global + local project"
-  echo "  ./shai-hulud.sh -l . --fix             # scan + remove malicious deps"
+  echo "  ./shai-hulud.sh -w .                   # scan all projects in current dir"
+  echo "  ./shai-hulud.sh -l ./my-project --fix  # scan + remove malicious deps"
   echo "  ./shai-hulud.sh --block                # scan + install .npmrc blocklist"
   echo ""
 }
@@ -634,6 +635,7 @@ main() {
   local do_block=false
   local do_fix=false
   local local_dirs=()
+  local workspaces=()
 
   [[ $# -eq 0 ]] && { banner; scan_global; report; exit 0; }
 
@@ -643,6 +645,7 @@ main() {
       -g|--global)      shift ;;  # global is always included
       -b|--block)       do_block=true; shift ;;
       -f|--fix)         do_fix=true; shift ;;
+      -w|--workspace)   shift; workspaces+=("$1"); shift ;;
       --force-block)    do_block=true; shift ;;
       -l|--local)       shift; local_dirs+=("$1"); shift ;;
       *)                local_dirs+=("$1"); shift ;;
@@ -663,6 +666,15 @@ main() {
     fi
   done
 
+  # Scan any workspaces
+  for ws in "${workspaces[@]}"; do
+    if [[ -d "$ws" ]]; then
+      scan_workspace "$ws"
+    else
+      warn "Workspace directory not found: $ws"
+    fi
+  done
+
   # Install blocklist if requested
   $do_block && write_npmrc_block
 
@@ -675,6 +687,38 @@ main() {
 
   # Exit code: 1 if any hits found
   [[ "$(get_hits)" -gt 0 ]] && exit 1 || exit 0
+}
+
+# ── Workspace Scanner ──────────────────────────────────────────────
+scan_workspace() {
+  local root="$1"
+  section "Scanning Workspace: $root"
+  info "Searching for npm projects (package.json)..."
+
+  set +e # Don't exit on individual project failures
+
+  # Find all package.json files, excluding node_modules
+  # We use a temporary file to collect paths to avoid subshell issues with find
+  local pjs_f
+  pjs_f=$(mktemp)
+  find "$root" -name "package.json" -not -path "*/node_modules/*" > "$pjs_f" 2>/dev/null || true
+
+  local count=0
+  while IFS= read -r pj; do
+    [[ -z "$pj" ]] && continue
+    local dir
+    dir=$(dirname "$pj")
+    scan_local_dir "$dir"
+    count=$((count + 1))
+  done < "$pjs_f"
+  rm -f "$pjs_f"
+
+  if [[ $count -eq 0 ]]; then
+    warn "No npm projects found in $root"
+  else
+    ok "Finished scanning $count projects in workspace"
+  fi
+  set -e
 }
 
 main "$@"
