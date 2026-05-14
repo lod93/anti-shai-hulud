@@ -27,7 +27,7 @@ See [`docs/affected-packages.md`](docs/affected-packages.md) for the full list.
 
 ```bash
 # Download
-curl -O https://raw.githubusercontent.com/YOUR_USERNAME/shai-hulud/main/shai-hulud.sh
+curl -O https://raw.githubusercontent.com/lod93/shai-hulud/main/shai-hulud.sh
 chmod +x shai-hulud.sh
 
 # Scan your global npm installs
